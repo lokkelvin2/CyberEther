@@ -72,6 +72,7 @@ struct SoapyApi {
     SoapyAbi::Kwargs* (*enumerate)(const SoapyAbi::Kwargs*, std::size_t*) = nullptr;
     SoapyAbi::Device* (*make)(const SoapyAbi::Kwargs*) = nullptr;
     int (*unmake)(SoapyAbi::Device*) = nullptr;
+    std::size_t (*getNumChannels)(const SoapyAbi::Device*, int) = nullptr;
     SoapyAbi::Range* (*getSampleRateRange)(const SoapyAbi::Device*, int, std::size_t,
                                            std::size_t*) = nullptr;
     SoapyAbi::Range* (*getFrequencyRange)(const SoapyAbi::Device*, int, std::size_t,
@@ -87,6 +88,17 @@ struct SoapyApi {
     int (*setGain)(SoapyAbi::Device*, int, std::size_t, double) = nullptr;
     SoapyAbi::ArgInfo* (*getSettingInfo)(const SoapyAbi::Device*, std::size_t*) = nullptr;
     int (*writeSetting)(SoapyAbi::Device*, const char*, const char*) = nullptr;
+    SoapyAbi::Range* (*getReferenceClockRates)(const SoapyAbi::Device*, std::size_t*) = nullptr;
+    int (*setReferenceClockRate)(SoapyAbi::Device*, double) = nullptr;
+    char** (*listClockSources)(const SoapyAbi::Device*, std::size_t*) = nullptr;
+    int (*setClockSource)(SoapyAbi::Device*, const char*) = nullptr;
+    char** (*listTimeSources)(const SoapyAbi::Device*, std::size_t*) = nullptr;
+    int (*setTimeSource)(SoapyAbi::Device*, const char*) = nullptr;
+    bool (*hasHardwareTime)(const SoapyAbi::Device*, const char*) = nullptr;
+    long long (*getHardwareTime)(const SoapyAbi::Device*, const char*) = nullptr;
+    int (*setHardwareTime)(SoapyAbi::Device*, long long, const char*) = nullptr;
+    char** (*listSensors)(const SoapyAbi::Device*, std::size_t*) = nullptr;
+    char* (*readSensor)(const SoapyAbi::Device*, const char*) = nullptr;
     SoapyAbi::Stream* (*setupStream)(SoapyAbi::Device*, int, const char*, const std::size_t*,
                                      std::size_t, const SoapyAbi::Kwargs*) = nullptr;
     int (*closeStream)(SoapyAbi::Device*, SoapyAbi::Stream*) = nullptr;

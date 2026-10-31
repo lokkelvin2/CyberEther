@@ -9,13 +9,19 @@ struct Soapy : public Block::Config {
     std::string modulePath = "";
     std::string deviceString = "";
     std::string streamString = "";
+    U64 channels = 1;
     std::string antenna = "";
+    std::string secondAntenna = "";
     F32 frequency = 96.9e6;
     F32 frequencyStep = 1000000.0;
     F32 sampleRate = 2.0e6;
     bool automaticGain = true;
     F32 manualGain = 0.0f;
     bool biasTee = false;
+    std::string clockSource = "";
+    F32 referenceFrequency = 0.0f;
+    std::string timeSource = "";
+    bool ppsSync = false;
     U64 numberOfBatches = 8;
     U64 numberOfTimeSamples = 8192;
     U64 bufferMultiplier = 4;
@@ -24,8 +30,9 @@ struct Soapy : public Block::Config {
     JST_BLOCK_DOMAIN("IO");
     JST_BLOCK_NODE_SIZE(M);
     JST_BLOCK_PARAMS(modulePath, deviceString, streamString,
-                     antenna, frequency, frequencyStep, sampleRate,
-                     automaticGain, manualGain, biasTee, numberOfBatches,
+                     channels, antenna, secondAntenna, frequency, frequencyStep,
+                     sampleRate, automaticGain, manualGain, biasTee, clockSource,
+                     referenceFrequency, timeSource, ppsSync, numberOfBatches,
                      numberOfTimeSamples, bufferMultiplier);
     JST_BLOCK_DESCRIPTION(
         "SoapySDR",
@@ -40,6 +47,12 @@ struct Soapy : public Block::Config {
         "the first time it is used.\n"
         "- **Changes drop older samples.** Retuning drops buffered samples, but the "
         "driver can still deliver a few older ones.\n"
+        "- **Two channels receive together.** With Channels 2, the radio's first and "
+        "second receive channels stream at the same frequency, rate, and gain, and the "
+        "two outputs hold samples taken at the same instants. Each channel listens on "
+        "one port at a time: on a USRP B210, the first channel is RF A and the second "
+        "is RF B, so RX2 and TX/RX can be received together as RF A RX2 and RF B "
+        "TX/RX.\n"
         "- **A slow chain loses samples.** When the chain falls behind, the oldest "
         "samples are overwritten and Buffer Loss rises.\n"
         "- **Automatic Gain off uses Manual Gain.** The saved gain is reapplied after "
@@ -52,6 +65,8 @@ struct Soapy : public Block::Config {
         "| **Output** (out) | CF32 | Batches x Samples, on a `batchAxis` then a "
         "`sampleAxis`. Sets `frequency` and `sampleRate` to the values applied to these"
         " samples. |\n"
+        "| **Output 2** (out) | CF32 | Same as Output, from the second channel. Only "
+        "with Channels 2. |\n"
         "\n"
         "## Settings\n"
         "\n"
@@ -60,8 +75,12 @@ struct Soapy : public Block::Config {
         "| **Device** | None | None and the radios found | Radio to open, saved as "
         "SoapySDR arguments. A saved radio that is missing shows as Configured device. "
         "|\n"
+        "| **Channels** | 1 | 1, 2 | Receive channels streamed together. 2 adds Output "
+        "2. |\n"
         "| **Antenna** | Default | Default and the radio's receive ports | Receive "
-        "port. Default keeps the driver's choice. |\n"
+        "port of the first channel. Default keeps the driver's choice. |\n"
+        "| **Antenna 2** | Default | Default and the radio's receive ports | Receive "
+        "port of the second channel, shown with Channels 2. |\n"
         "| **Frequency** | 96.9 MHz | Within the radio's range | Center frequency of "
         "the output. |\n"
         "| **Sample Rate** | 2 MHz | Within the radio's range | Complex samples per "
@@ -71,6 +90,19 @@ struct Soapy : public Block::Config {
         "gain, shown when Automatic Gain is off. Limits follow the tuned frequency. |\n"
         "| **Bias-T** | Off | On, Off | Powers an active antenna through the cable, on "
         "radios that support it. Hidden once the radio is open and lacks it. |\n"
+        "| **Clock Source** | Default | Default and the radio's clock sources | "
+        "Frequency reference, such as internal, external (the REF input), or gpsdo. |\n"
+        "| **Reference Frequency** | 0 MHz | 0 or a rate the driver supports | "
+        "Frequency of the external reference, shown for a non-internal Clock Source. 0 "
+        "keeps the driver's default. Ettus B2xx radios need 10 MHz and cannot change "
+        "it. |\n"
+        "| **Time Source** | Default | Default and the radio's time sources | Source "
+        "of the PPS that marks whole seconds, such as internal, external (the PPS "
+        "input), or gpsdo. |\n"
+        "| **PPS Sync** | Off | On, Off | Sets the radio time to the host's UTC second "
+        "at a PPS edge, then starts streaming on the next edge, shown with a Time "
+        "Source. Radios sharing a PPS start on the same edge. Opening takes about 2 "
+        "seconds. |\n"
         "| **Batches** | 8 batches | 1 or more | Batches per output buffer. |\n"
         "| **Samples** | 8,192 samples | 1 or more | Samples per batch, and the FFT "
         "size downstream. |\n"
@@ -87,7 +119,11 @@ struct Soapy : public Block::Config {
         "since the stream started. Overflows the radio reported show next to it as OVF."
         " |\n"
         "| **Throughput** | Rate the chain reads in MB/s, next to the rate the radio "
-        "sends at 8 bytes per sample. |\n"
+        "sends at 8 bytes per sample and channel. |\n"
+        "| **Reference** | Whether the radio is locked to the external reference, read "
+        "every second from its `ref_locked` sensor. |\n"
+        "| **PPS** | Whether PPS edges arrive, with the radio time of the last one, "
+        "checked every second while a Time Source is set. |\n"
         "\n"
         "## Recipes\n"
         "\n"
@@ -124,6 +160,12 @@ struct Soapy : public Block::Config {
         "| Buffer Loss rises above 0% | The chain reads slower than the radio sends | "
         "Lower Sample Rate or lighten the chain. Raise Buffer Multiplier for short "
         "stalls. |\n"
+        "| The block reports that the device cannot stream 2 channels | The radio has "
+        "one receive channel | Set Channels to 1. |\n"
+        "| Reference shows Not locked | No reference on the REF input, or the wrong "
+        "frequency | Connect the reference, 10 MHz for Ettus B2xx. |\n"
+        "| The block reports no PPS edge | No pulse on the selected Time Source | Check"
+        " the PPS cable, or turn PPS Sync off. |\n"
         "\n"
         "## Setup\n"
         "\n"
@@ -137,11 +179,12 @@ struct Soapy : public Block::Config {
         "\n"
         "## Under the Hood\n"
         "\n"
-        "A receive thread reads the radio into a ring buffer, and each cycle copies out"
-        " one full buffer once enough samples have arrived. Frequency, Sample Rate, and"
-        " gain changes are applied to the running stream, and Frequency and Sample Rate"
-        " changes empty the ring buffer. The Bias-T is switched off again when the "
-        "block closes the radio.\n"
+        "A receive thread reads the radio into a ring buffer per channel, and each "
+        "cycle copies out one full buffer per channel once enough samples have arrived."
+        " The rings are filled and emptied together, so the channels stay aligned. "
+        "Frequency, Sample Rate, and gain changes are applied to the running stream, "
+        "and Frequency and Sample Rate changes empty the ring buffer. The Bias-T is "
+        "switched off again when the block closes the radio.\n"
         "\n"
         "## See Also\n"
         "\n"

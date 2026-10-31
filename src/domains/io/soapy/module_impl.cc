@@ -15,11 +15,20 @@ SoapyImpl::~SoapyImpl() {
     stopReceiver();
 }
 
+std::string SoapyImpl::OutputName(const U64 channel) {
+    return channel == 0 ? "signal" : jst::fmt::format("signal{}", channel + 1);
+}
+
 Result SoapyImpl::validate() {
     const auto& config = *candidate();
     validatedOutputSizeBytes = 0;
     validatedInternalElements = 0;
     validatedInternalSizeBytes = 0;
+
+    if (config.channels == 0 || config.channels > MaxChannels) {
+        JST_ERROR("[MODULE_SOAPY] Channels must be between 1 and {}.", MaxChannels);
+        return Result::ERROR;
+    }
 
     if (!std::isfinite(config.frequency)) {
         JST_ERROR("[MODULE_SOAPY] Frequency must be finite.");
@@ -33,6 +42,11 @@ Result SoapyImpl::validate() {
 
     if (!std::isfinite(config.manualGain)) {
         JST_ERROR("[MODULE_SOAPY] Manual gain must be finite.");
+        return Result::ERROR;
+    }
+
+    if (!std::isfinite(config.referenceFrequency) || config.referenceFrequency < 0.0f) {
+        JST_ERROR("[MODULE_SOAPY] Reference frequency must be finite and not negative.");
         return Result::ERROR;
     }
 
@@ -87,7 +101,9 @@ Result SoapyImpl::validate() {
 }
 
 Result SoapyImpl::define() {
-    JST_CHECK(defineInterfaceOutput("signal"));
+    for (U64 channel = 0; channel < channels; ++channel) {
+        JST_CHECK(defineInterfaceOutput(OutputName(channel)));
+    }
 
     return Result::SUCCESS;
 }
@@ -109,18 +125,24 @@ Result SoapyImpl::create() {
     bufferFill.publish(0.0f);
     deviceOverflows.publish(0);
     throughput.publish({0.0f, 0.0f});
+    referenceLock.publish(std::nullopt);
+    ppsStatus.publish({});
+    ppsMonitor = {};
 
     JST_CHECK(receiverDevice.open(deviceString));
     JST_CHECK(receiverDevice.validateSettings(sampleRate, frequency));
     JST_CHECK(allocateBuffers());
     JST_CHECK(configureDevice());
 
-    outputs()["signal"].produced(name(), "signal", buffer);
+    for (U64 channel = 0; channel < channels; ++channel) {
+        const auto output = OutputName(channel);
+        outputs()[output].produced(name(), output, buffers[channel]);
+    }
 
     generation = 0;
     resetStream(frequency, sampleRate);
     publishedMetadata = {};
-    JST_CHECK(publishMetadata(stream.metadata()));
+    JST_CHECK(publishMetadata(streams[0].metadata()));
 
     JST_CHECK(startReceiver());
 
@@ -129,12 +151,14 @@ Result SoapyImpl::create() {
 
 Result SoapyImpl::allocateBuffers() {
     try {
-        JST_CHECK(buffer.create(device(), DataType::CF32, {numberOfBatches, numberOfTimeSamples}));
-        JST_CHECK(SetSignalAxes(buffer, {
-            .sample = Index{1},
-            .batch = Index{0},
-        }));
-        JST_CHECK(stream.resize(validatedInternalElements));
+        for (U64 channel = 0; channel < channels; ++channel) {
+            JST_CHECK(buffers[channel].create(device(), DataType::CF32, {numberOfBatches, numberOfTimeSamples}));
+            JST_CHECK(SetSignalAxes(buffers[channel], {
+                .sample = Index{1},
+                .batch = Index{0},
+            }));
+            JST_CHECK(streams[channel].resize(validatedInternalElements));
+        }
     } catch (const std::bad_array_new_length&) {
         JST_ERROR("[MODULE_SOAPY] Internal buffer dimensions are too large.");
         return Result::ERROR;
@@ -153,11 +177,33 @@ Result SoapyImpl::configureDevice() {
         .automaticGain = automaticGain,
         .gain = manualGain,
     };
-    JST_CHECK(receiverDevice.setAntenna(antenna));
+    JST_CHECK(receiverDevice.setChannels(channels));
+    // References and time sources settle before tuning, as UHD recommends.
+    JST_CHECK(receiverDevice.setClockSource(clockSource));
+    JST_CHECK(receiverDevice.setReferenceClockRate(referenceFrequency));
+    JST_CHECK(receiverDevice.setTimeSource(timeSource));
+    JST_CHECK(receiverDevice.setAntenna(0, antenna));
+    if (channels > 1) {
+        JST_CHECK(receiverDevice.setAntenna(1, secondAntenna));
+    }
     JST_CHECK(applyTuning(desired, true));
     manualGain = tuned.gain;
     JST_CHECK(receiverDevice.setBiasTee(biasTee));
-    JST_CHECK(receiverDevice.startStream(streamString));
+
+    // Set up the stream before syncing: it can change the master clock and with it the device time.
+    JST_CHECK(receiverDevice.setupStream(streamString));
+
+    std::optional<I64> startTimeNs;
+    // PPS Sync is only offered with a Time Source, so a hidden saved value stays inactive.
+    if (ppsSync && !timeSource.empty()) {
+        I64 edgeTimeNs = 0;
+        JST_CHECK(receiverDevice.syncTimeToPps(edgeTimeNs));
+        // Start on the next PPS edge, so radios synced to the same PPS start on the same edge.
+        startTimeNs = edgeTimeNs + 1'000'000'000;
+        JST_INFO("[MODULE_SOAPY] Device time synced to PPS. Streaming starts at {} s.",
+                 *startTimeNs / 1'000'000'000);
+    }
+    JST_CHECK(receiverDevice.activateStream(startTimeNs));
     return Result::SUCCESS;
 }
 
@@ -204,6 +250,8 @@ Result SoapyImpl::destroy() {
 
     bufferFill.publish(0.0f);
     throughput.publish({0.0f, 0.0f});
+    referenceLock.publish(std::nullopt);
+    ppsStatus.publish({});
 
     return Result::SUCCESS;
 }
@@ -214,8 +262,14 @@ Result SoapyImpl::reconfigure() {
     if (errored || newConfig.modulePath != modulePath ||
         newConfig.deviceString != deviceString ||
         newConfig.streamString != streamString ||
+        newConfig.channels != channels ||
         newConfig.antenna != antenna ||
+        newConfig.secondAntenna != secondAntenna ||
         newConfig.biasTee != biasTee ||
+        newConfig.clockSource != clockSource ||
+        newConfig.referenceFrequency != referenceFrequency ||
+        newConfig.timeSource != timeSource ||
+        newConfig.ppsSync != ppsSync ||
         newConfig.numberOfBatches != numberOfBatches ||
         newConfig.numberOfTimeSamples != numberOfTimeSamples ||
         newConfig.bufferMultiplier != bufferMultiplier) {
@@ -253,39 +307,102 @@ Result SoapyImpl::reconfigure() {
 }
 
 void SoapyImpl::resetStream(const F32 appliedFrequency, const F32 appliedSampleRate) {
-    stream.reset({
-        .frequency = appliedFrequency,
-        .sampleRate = appliedSampleRate,
-        .generation = ++generation,
-    });
+    std::lock_guard lock(channelMutex);
+    ++generation;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        streams[channel].reset({
+            .frequency = appliedFrequency,
+            .sampleRate = appliedSampleRate,
+            .generation = generation,
+        });
+    }
 }
 
 Result SoapyImpl::publishMetadata(const Radio::StreamBuffer::Metadata& metadata) {
     if (metadata == publishedMetadata) {
         return Result::SUCCESS;
     }
-    JST_CHECK(buffer.setAttribute("frequency", static_cast<F32>(metadata.frequency)));
-    JST_CHECK(buffer.setAttribute("sampleRate", static_cast<F32>(metadata.sampleRate)));
+    for (U64 channel = 0; channel < channels; ++channel) {
+        JST_CHECK(buffers[channel].setAttribute("frequency", static_cast<F32>(metadata.frequency)));
+        JST_CHECK(buffers[channel].setAttribute("sampleRate", static_cast<F32>(metadata.sampleRate)));
+    }
     publishedMetadata = metadata;
     return Result::SUCCESS;
 }
 
 Result SoapyImpl::emitFrame() {
+    std::lock_guard lock(channelMutex);
     Radio::StreamBuffer::Metadata metadata;
-    const auto result = stream.pop(buffer.data<CF32>(), buffer.size(), metadata);
-    if (result == Result::INCOMPLETE) {
-        return Result::YIELD;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        Radio::StreamBuffer::Metadata channelMetadata;
+        const auto result = streams[channel].pop(buffers[channel].data<CF32>(), buffers[channel].size(),
+                                                 channelMetadata);
+        // The rings only differ right after a reset, and then the next frame is aligned again.
+        if (result == Result::INCOMPLETE) {
+            return Result::YIELD;
+        }
+        JST_CHECK(result);
+        if (channel == 0) {
+            metadata = channelMetadata;
+        }
     }
-    JST_CHECK(result);
     return publishMetadata(metadata);
+}
+
+bool SoapyImpl::monitorsReference() const {
+    return !clockSource.empty() && clockSource != "internal" && receiverDevice.supportsReferenceLock();
+}
+
+bool SoapyImpl::monitorsPps() const {
+    return !timeSource.empty() && receiverDevice.supportsPpsTime();
+}
+
+void SoapyImpl::pollTiming() {
+    if (monitorsReference()) {
+        const auto locked = receiverDevice.readReferenceLock();
+        if (locked && locked != referenceLock.get()) {
+            // Debug level: a missing reference makes the lock flip every second.
+            JST_DEBUG("[MODULE_SOAPY] Reference on '{}' is {}.", clockSource, *locked ? "locked" : "not locked");
+        }
+        referenceLock.publish(locked);
+    }
+
+    if (monitorsPps()) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto time = receiverDevice.readLastPpsTime();
+        if (time && time != ppsMonitor.lastTimeNs) {
+            // The first reading has no earlier one to compare with, so it does not count as a pulse.
+            if (ppsMonitor.lastTimeNs) {
+                ppsMonitor.lastChange = now;
+            }
+            ppsMonitor.lastTimeNs = time;
+        }
+        const bool present = ppsMonitor.lastChange != std::chrono::steady_clock::time_point{} &&
+                             now - ppsMonitor.lastChange < std::chrono::milliseconds(2500);
+        if (present != ppsStatus.get().present) {
+            JST_DEBUG("[MODULE_SOAPY] PPS on '{}' is {}.", timeSource, present ? "present" : "missing");
+        }
+        ppsStatus.publish({
+            .monitored = true,
+            .present = present,
+            .lastTimeNs = ppsMonitor.lastTimeNs.value_or(0),
+        });
+    }
 }
 
 Result SoapyImpl::soapyThreadLoop() {
     constexpr std::size_t temporaryBufferSize = 8192;
-    std::vector<CF32> tmp(temporaryBufferSize);
-    const auto readSize = std::min<std::size_t>(temporaryBufferSize, stream.capacity());
-    const auto readBuffer = std::span<CF32>{tmp.data(), readSize};
+    constexpr auto timingPollPeriod = std::chrono::seconds(1);
+    std::array<std::vector<CF32>, MaxChannels> tmp;
+    std::array<CF32*, MaxChannels> readBuffers{};
+    for (U64 channel = 0; channel < channels; ++channel) {
+        tmp[channel].resize(temporaryBufferSize);
+        readBuffers[channel] = tmp[channel].data();
+    }
+    const auto readSize = std::min<std::size_t>(temporaryBufferSize, streams[0].capacity());
+    const auto readSpan = std::span<CF32* const>{readBuffers.data(), static_cast<std::size_t>(channels)};
     SoapyReceiveStatus receiveStatus;
+    auto nextTimingPoll = std::chrono::steady_clock::now();
 
     while (streaming) {
         const auto lock = access.lock();
@@ -293,8 +410,13 @@ Result SoapyImpl::soapyThreadLoop() {
             break;
         }
 
-        const U64 readGeneration = stream.metadata().generation;
-        const auto received = receiverDevice.read(readBuffer);
+        if (std::chrono::steady_clock::now() >= nextTimingPoll) {
+            pollTiming();
+            nextTimingPoll = std::chrono::steady_clock::now() + timingPollPeriod;
+        }
+
+        const U64 readGeneration = streams[0].metadata().generation;
+        const auto received = receiverDevice.read(readSpan, readSize);
         if (!streaming || errored) {
             break;
         }
@@ -309,17 +431,24 @@ Result SoapyImpl::soapyThreadLoop() {
             errored = true;
             break;
         } else if (action == SoapyReceiveStatus::Action::Samples) {
-            stream.push(readGeneration, tmp.data(), received.sampleCount);
+            {
+                // Push the later channels first: readers wait on channel 0.
+                std::lock_guard channelLock(channelMutex);
+                for (U64 channel = channels; channel-- > 0;) {
+                    streams[channel].push(readGeneration, tmp[channel].data(), received.sampleCount);
+                }
+            }
             Scheduler::Context::NotifyPendingCompute();
-            const U64 capacity = stream.capacity();
+            const U64 capacity = streams[0].capacity();
             if (capacity > 0) {
-                const F32 newFill = static_cast<F32>(stream.size()) /
-                                      static_cast<F32>(capacity);
+                const F32 newFill = static_cast<F32>(streams[0].size()) /
+                                    static_cast<F32>(capacity);
                 const F32 smoothedFill = bufferFill.get() * 0.99f + newFill * 0.01f;
                 bufferFill.publish(smoothedFill);
             }
-            const F32 actualMB = static_cast<F32>(stream.throughput() * sizeof(CF32)) / 1e6f;
-            const F32 expectedMB = static_cast<F32>(stream.metadata().sampleRate * sizeof(CF32)) / 1e6f;
+            const auto bytesPerSample = static_cast<F32>(sizeof(CF32) * channels);
+            const F32 actualMB = static_cast<F32>(streams[0].throughput()) * bytesPerSample / 1e6f;
+            const F32 expectedMB = static_cast<F32>(streams[0].metadata().sampleRate) * bytesPerSample / 1e6f;
             throughput.publish({actualMB, expectedMB});
         }
     }
@@ -332,7 +461,7 @@ F32 SoapyImpl::getBufferFill() const {
 }
 
 F64 SoapyImpl::getBufferLoss() const {
-    const auto stats = stream.statistics();
+    const auto stats = streams[0].statistics();
     return stats.pushedSamples > 0
         ? static_cast<F64>(stats.overwrittenSamples) / static_cast<F64>(stats.pushedSamples)
         : 0.0;
@@ -346,8 +475,16 @@ std::pair<F32, F32> SoapyImpl::getThroughput() const {
     return throughput.get();
 }
 
-std::vector<std::string> SoapyImpl::listAntennas() const {
-    return receiverDevice.listAntennas();
+std::vector<std::string> SoapyImpl::listAntennas(const U64 channel) const {
+    return receiverDevice.listAntennas(channel);
+}
+
+std::vector<std::string> SoapyImpl::listClockSources() const {
+    return receiverDevice.listClockSources();
+}
+
+std::vector<std::string> SoapyImpl::listTimeSources() const {
+    return receiverDevice.listTimeSources();
 }
 
 bool SoapyImpl::supportsBiasTee() const {
@@ -356,6 +493,14 @@ bool SoapyImpl::supportsBiasTee() const {
 
 std::optional<SoapyAbi::Range> SoapyImpl::getGainRange() const {
     return gainRange.get();
+}
+
+std::optional<bool> SoapyImpl::getReferenceLock() const {
+    return referenceLock.get();
+}
+
+SoapyImpl::PpsStatus SoapyImpl::getPpsStatus() const {
+    return ppsStatus.get();
 }
 
 Result SoapyImpl::applyTuning(const Tuning& desired, const bool force) {

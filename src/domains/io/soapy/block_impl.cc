@@ -22,10 +22,13 @@ struct SoapyImpl : public Block::Impl, public DynamicConfig<Blocks::Soapy> {
     Modules::SoapyImpl* moduleImpl = nullptr;
 
  private:
-    Result updateAntennaFormat();
+    Result updateOptionFormats();
     Result updateManualGainFormat();
-    Parser::Map antennaFormat(const std::string& selected,
-                              const std::vector<std::string>& antennas = {});
+    std::string referenceLabel() const;
+    std::string ppsLabel() const;
+    static bool ShowsReferenceFrequency(const std::string& clockSource);
+    static Parser::Map optionsFormat(const std::string& selected,
+                                     const std::vector<std::string>& values = {});
     Parser::Map manualGainFormat(const std::optional<Modules::SoapyAbi::Range>& range = std::nullopt);
 };
 
@@ -48,12 +51,18 @@ Result SoapyImpl::configure() {
     moduleConfig->modulePath = modulePath;
     moduleConfig->deviceString = deviceString;
     moduleConfig->streamString = streamString;
+    moduleConfig->channels = channels;
     moduleConfig->antenna = antenna;
+    moduleConfig->secondAntenna = secondAntenna;
     moduleConfig->frequency = frequency;
     moduleConfig->sampleRate = sampleRate;
     moduleConfig->automaticGain = automaticGain;
     moduleConfig->manualGain = manualGain;
     moduleConfig->biasTee = biasTee;
+    moduleConfig->clockSource = clockSource;
+    moduleConfig->referenceFrequency = referenceFrequency;
+    moduleConfig->timeSource = timeSource;
+    moduleConfig->ppsSync = ppsSync;
     moduleConfig->numberOfBatches = numberOfBatches;
     moduleConfig->numberOfTimeSamples = numberOfTimeSamples;
     moduleConfig->bufferMultiplier = bufferMultiplier;
@@ -67,6 +76,12 @@ Result SoapyImpl::define() {
     JST_CHECK(defineInterfaceOutput("signal",
                                     "Output",
                                     "The output buffer containing samples from the SDR device."));
+
+    if (config.channels > 1) {
+        JST_CHECK(defineInterfaceOutput(Modules::SoapyImpl::OutputName(1),
+                                        "Output 2",
+                                        "Samples from the second channel, taken at the same instants as Output."));
+    }
 
     Parser::Sequence deviceOptions{Parser::Map{{"label", "None"}, {"value", ""}}};
     bool selectionListed = config.deviceString.empty();
@@ -86,10 +101,22 @@ Result SoapyImpl::define() {
                                     "Select a device to receive samples. Choose None to disconnect.",
                                     {{"type", "dropdown"}, {"options", std::move(deviceOptions)}}));
 
+    JST_CHECK(defineInterfaceConfig("channels",
+                                    "Channels",
+                                    "Receive channels streamed together. 2 adds Output 2. Changes restart the receiver.",
+                                    {{"type", "uint"}, {"unit", "channels"}}));
+
     JST_CHECK(defineInterfaceConfig("antenna",
-                                    "Antenna",
-                                    "Receive antenna port. Changes restart the receiver.",
-                                    antennaFormat(config.antenna)));
+                                    config.channels > 1 ? "Antenna 1" : "Antenna",
+                                    "Receive antenna port of the first channel. Changes restart the receiver.",
+                                    optionsFormat(config.antenna)));
+
+    if (config.channels > 1) {
+        JST_CHECK(defineInterfaceConfig("secondAntenna",
+                                        "Antenna 2",
+                                        "Receive antenna port of the second channel. Changes restart the receiver.",
+                                        optionsFormat(config.secondAntenna)));
+    }
 
     JST_CHECK(defineInterfaceConfig("frequency",
                                     "Frequency",
@@ -124,6 +151,32 @@ Result SoapyImpl::define() {
         JST_CHECK(defineInterfaceConfig("biasTee",
                                         "Bias-T",
                                         "Enable antenna power through the antenna cable.",
+                                        {{"type", "bool"}}));
+    }
+
+    JST_CHECK(defineInterfaceConfig("clockSource",
+                                    "Clock Source",
+                                    "Frequency reference, such as the external REF input. Changes restart the receiver.",
+                                    optionsFormat(config.clockSource)));
+
+    if (ShowsReferenceFrequency(config.clockSource)) {
+        JST_CHECK(defineInterfaceConfig("referenceFrequency",
+                                        "Reference Frequency",
+                                        "External reference frequency. 0 keeps the driver's default. "
+                                        "Ettus B2xx radios need 10 MHz.",
+                                        {{"type", "float"}, {"unit", "MHz"}, {"scale", 1.0e6f}, {"precision", 3}}));
+    }
+
+    JST_CHECK(defineInterfaceConfig("timeSource",
+                                    "Time Source",
+                                    "Source of the PPS that marks whole seconds, such as the external PPS input. "
+                                    "Changes restart the receiver.",
+                                    optionsFormat(config.timeSource)));
+
+    if (!config.timeSource.empty()) {
+        JST_CHECK(defineInterfaceConfig("ppsSync",
+                                        "PPS Sync",
+                                        "Set the radio time to UTC at a PPS edge and start streaming on the next edge.",
                                         {{"type", "bool"}}));
     }
 
@@ -184,30 +237,54 @@ Result SoapyImpl::define() {
                 jst::fmt::format("{:.1f} / {:.1f} MB/s", actual, expected), fraction};
         }));
 
+    JST_CHECK(defineInterfaceMetric("reference",
+                                    "Reference",
+                                    "Lock to the external frequency reference.",
+                                    {{"type", "label"}},
+        [this]() -> std::any { return referenceLabel(); }));
+
+    JST_CHECK(defineInterfaceMetric("pps",
+                                    "PPS",
+                                    "PPS edges seen on the time source, with the radio time of the last one.",
+                                    {{"type", "label"}},
+        [this]() -> std::any { return ppsLabel(); }));
+
     return Result::SUCCESS;
 }
 
 Result SoapyImpl::create() {
     JST_CHECK(moduleCreate("soapy", moduleConfig, {}));
-    JST_CHECK(moduleExposeOutput("signal", {"soapy", "signal"}));
+    for (U64 channel = 0; channel < channels; ++channel) {
+        const auto output = Modules::SoapyImpl::OutputName(channel);
+        JST_CHECK(moduleExposeOutput(output, {"soapy", output}));
+    }
 
     moduleImpl = moduleHandle("soapy")->getImpl<Modules::SoapyImpl>();
-    JST_CHECK(updateAntennaFormat());
+    JST_CHECK(updateOptionFormats());
     JST_CHECK(updateManualGainFormat());
 
     return Result::SUCCESS;
 }
 
 Result SoapyImpl::reconfigure() {
-    JST_CHECK(updateAntennaFormat());
+    JST_CHECK(updateOptionFormats());
     JST_CHECK(updateManualGainFormat());
 
     return Result::SUCCESS;
 }
 
-Result SoapyImpl::updateAntennaFormat() {
-    return updateInterfaceConfigFormat("antenna",
-                                       antennaFormat(antenna, moduleImpl->listAntennas()));
+Result SoapyImpl::updateOptionFormats() {
+    JST_CHECK(updateInterfaceConfigFormat("antenna", optionsFormat(antenna, moduleImpl->listAntennas(0))));
+    if (channels > 1) {
+        JST_CHECK(updateInterfaceConfigFormat("secondAntenna",
+                                              optionsFormat(secondAntenna, moduleImpl->listAntennas(1))));
+    }
+    JST_CHECK(updateInterfaceConfigFormat("clockSource",
+                                          optionsFormat(clockSource, moduleImpl->listClockSources())));
+    JST_CHECK(updateInterfaceConfigFormat("timeSource",
+                                          optionsFormat(timeSource, moduleImpl->listTimeSources())));
+
+    return Result::SUCCESS;
 }
 
 Result SoapyImpl::updateManualGainFormat() {
@@ -224,13 +301,52 @@ Result SoapyImpl::updateManualGainFormat() {
     return Result::SUCCESS;
 }
 
-Parser::Map SoapyImpl::antennaFormat(const std::string& selected,
-                                     const std::vector<std::string>& antennas) {
+std::string SoapyImpl::referenceLabel() const {
+    if (clockSource.empty()) {
+        return "Default";
+    }
+    if (!ShowsReferenceFrequency(clockSource)) {
+        return "Internal";
+    }
+    const auto locked = moduleImpl ? moduleImpl->getReferenceLock() : std::nullopt;
+    if (!locked) {
+        return "N/A";
+    }
+    return *locked ? "Locked" : "Not locked";
+}
+
+std::string SoapyImpl::ppsLabel() const {
+    if (timeSource.empty()) {
+        return "Not used";
+    }
+    const auto status = moduleImpl ? moduleImpl->getPpsStatus() : Modules::SoapyImpl::PpsStatus{};
+    if (!status.monitored) {
+        return "N/A";
+    }
+    if (!status.present) {
+        return "No pulse";
+    }
+    const I64 seconds = status.lastTimeNs / 1'000'000'000;
+    if (ppsSync) {
+        // Synced radios count UTC seconds, so show the time of day.
+        const I64 secondOfDay = ((seconds % 86400) + 86400) % 86400;
+        return jst::fmt::format("Present, {:02}:{:02}:{:02} UTC",
+                                secondOfDay / 3600, (secondOfDay / 60) % 60, secondOfDay % 60);
+    }
+    return jst::fmt::format("Present, t = {} s", seconds);
+}
+
+bool SoapyImpl::ShowsReferenceFrequency(const std::string& clockSource) {
+    return !clockSource.empty() && clockSource != "internal";
+}
+
+Parser::Map SoapyImpl::optionsFormat(const std::string& selected,
+                                     const std::vector<std::string>& values) {
     Parser::Sequence options{Parser::Map{{"label", "Default"}, {"value", ""}}};
     bool selectionListed = selected.empty();
-    for (const auto& antenna : antennas) {
-        selectionListed = selectionListed || antenna == selected;
-        options.emplace_back(Parser::Map{{"label", antenna}, {"value", antenna}});
+    for (const auto& value : values) {
+        selectionListed = selectionListed || value == selected;
+        options.emplace_back(Parser::Map{{"label", value}, {"value", value}});
     }
     if (!selectionListed) {
         options.emplace_back(Parser::Map{{"label", selected}, {"value", selected}});

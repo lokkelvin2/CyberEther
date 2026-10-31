@@ -52,6 +52,7 @@ bool ResolveAll(void* handle, SoapyApi& api, std::string& missing) {
            Resolve(handle, api.enumerate, "SoapySDRDevice_enumerate", missing) &&
            Resolve(handle, api.make, "SoapySDRDevice_make", missing) &&
            Resolve(handle, api.unmake, "SoapySDRDevice_unmake", missing) &&
+           Resolve(handle, api.getNumChannels, "SoapySDRDevice_getNumChannels", missing) &&
            Resolve(handle, api.getSampleRateRange, "SoapySDRDevice_getSampleRateRange", missing) &&
            Resolve(handle, api.getFrequencyRange, "SoapySDRDevice_getFrequencyRange", missing) &&
            Resolve(handle, api.listAntennas, "SoapySDRDevice_listAntennas", missing) &&
@@ -64,6 +65,17 @@ bool ResolveAll(void* handle, SoapyApi& api, std::string& missing) {
            Resolve(handle, api.setGain, "SoapySDRDevice_setGain", missing) &&
            Resolve(handle, api.getSettingInfo, "SoapySDRDevice_getSettingInfo", missing) &&
            Resolve(handle, api.writeSetting, "SoapySDRDevice_writeSetting", missing) &&
+           Resolve(handle, api.getReferenceClockRates, "SoapySDRDevice_getReferenceClockRates", missing) &&
+           Resolve(handle, api.setReferenceClockRate, "SoapySDRDevice_setReferenceClockRate", missing) &&
+           Resolve(handle, api.listClockSources, "SoapySDRDevice_listClockSources", missing) &&
+           Resolve(handle, api.setClockSource, "SoapySDRDevice_setClockSource", missing) &&
+           Resolve(handle, api.listTimeSources, "SoapySDRDevice_listTimeSources", missing) &&
+           Resolve(handle, api.setTimeSource, "SoapySDRDevice_setTimeSource", missing) &&
+           Resolve(handle, api.hasHardwareTime, "SoapySDRDevice_hasHardwareTime", missing) &&
+           Resolve(handle, api.getHardwareTime, "SoapySDRDevice_getHardwareTime", missing) &&
+           Resolve(handle, api.setHardwareTime, "SoapySDRDevice_setHardwareTime", missing) &&
+           Resolve(handle, api.listSensors, "SoapySDRDevice_listSensors", missing) &&
+           Resolve(handle, api.readSensor, "SoapySDRDevice_readSensor", missing) &&
            Resolve(handle, api.setupStream, "SoapySDRDevice_setupStream", missing) &&
            Resolve(handle, api.closeStream, "SoapySDRDevice_closeStream", missing) &&
            Resolve(handle, api.activateStream, "SoapySDRDevice_activateStream", missing) &&

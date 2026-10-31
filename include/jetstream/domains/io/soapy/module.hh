@@ -10,20 +10,27 @@ struct Soapy : public Module::Config {
     std::string modulePath = "";
     std::string deviceString = "";
     std::string streamString = "";
+    U64 channels = 1;
     std::string antenna = "";
+    std::string secondAntenna = "";
     F32 frequency = 96.9e6;
     F32 sampleRate = 2.0e6;
     bool automaticGain = true;
     F32 manualGain = 0.0f;
     bool biasTee = false;
+    std::string clockSource = "";
+    F32 referenceFrequency = 0.0f;
+    std::string timeSource = "";
+    bool ppsSync = false;
     U64 numberOfBatches = 8;
     U64 numberOfTimeSamples = 8192;
     U64 bufferMultiplier = 4;
 
     JST_MODULE_TYPE(soapy);
     JST_MODULE_PARAMS(modulePath, deviceString, streamString,
-                      antenna, frequency, sampleRate,
-                      automaticGain, manualGain, biasTee, numberOfBatches,
+                      channels, antenna, secondAntenna, frequency, sampleRate,
+                      automaticGain, manualGain, biasTee, clockSource,
+                      referenceFrequency, timeSource, ppsSync, numberOfBatches,
                       numberOfTimeSamples, bufferMultiplier);
 };
 

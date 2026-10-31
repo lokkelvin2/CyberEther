@@ -32,13 +32,19 @@ TEST_CASE("Soapy block preserves public defaults and saved settings",
     REQUIRE(config.modulePath.empty());
     REQUIRE(config.deviceString.empty());
     REQUIRE(config.streamString.empty());
+    REQUIRE(config.channels == 1);
     REQUIRE(config.antenna.empty());
+    REQUIRE(config.secondAntenna.empty());
     REQUIRE(config.frequency == 96.9e6f);
     REQUIRE(config.frequencyStep == 1000000.0f);
     REQUIRE(config.sampleRate == 2.0e6f);
     REQUIRE(config.automaticGain);
     REQUIRE(config.manualGain == 0.0f);
     REQUIRE_FALSE(config.biasTee);
+    REQUIRE(config.clockSource.empty());
+    REQUIRE(config.referenceFrequency == 0.0f);
+    REQUIRE(config.timeSource.empty());
+    REQUIRE_FALSE(config.ppsSync);
     REQUIRE(config.numberOfBatches == 8);
     REQUIRE(config.numberOfTimeSamples == 8192);
     REQUIRE(config.bufferMultiplier == 4);
@@ -46,10 +52,16 @@ TEST_CASE("Soapy block preserves public defaults and saved settings",
     config.modulePath = "saved-device-module";
     config.deviceString = "driver=saved,serial=123";
     config.streamString = "bufflen=8192";
+    config.channels = 2;
     config.antenna = "RX";
+    config.secondAntenna = "TX/RX";
     config.automaticGain = false;
     config.manualGain = 20.0f;
     config.biasTee = true;
+    config.clockSource = "external";
+    config.referenceFrequency = 10.0e6f;
+    config.timeSource = "external";
+    config.ppsSync = true;
     Parser::Map saved;
     REQUIRE(config.serialize(saved) == Result::SUCCESS);
     Blocks::Soapy restored;
@@ -138,6 +150,51 @@ TEST_CASE_METHOD(FlowgraphFixture,
         {"type", "range"}, {"min", 0.0f}, {"max", 60.0f}, {"unit", "dB"},
     });
     REQUIRE(Parser::Get<F32>(block.config, "manualGain") == 20.0f);
+    REQUIRE(flowgraph->blockDestroy("radio", false) == Result::SUCCESS);
+}
+
+TEST_CASE_METHOD(FlowgraphFixture,
+                 "Soapy block shows channel, clock, and time fields for the settings in use",
+                 "[modules][io][soapy][block][channels]") {
+    const TestSupport::ScopedEnvironment environment("CYBERETHER_SOAPYSDR_LIBRARY");
+    REQUIRE(environment.set("/__cyberether_missing_soapy__/library"));
+    const RuntimeReset reset;
+    const auto hasConfig = [](const auto& block, const std::string& name) {
+        return std::any_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
+                           [&](const auto& field) { return field.name == name; });
+    };
+    const auto outputNames = [](const auto& block) {
+        std::vector<std::string> names;
+        for (const auto& output : block.interfaceOutputs) {
+            names.push_back(output.name);
+        }
+        return names;
+    };
+
+    Blocks::Soapy config;
+    REQUIRE(flowgraph->blockCreate("radio", config, {}) == Result::SUCCESS);
+    auto block = viewBlock("radio");
+    REQUIRE(outputNames(block) == std::vector<std::string>{"signal"});
+    REQUIRE(hasConfig(block, "clockSource"));
+    REQUIRE(hasConfig(block, "timeSource"));
+    REQUIRE_FALSE(hasConfig(block, "secondAntenna"));
+    REQUIRE_FALSE(hasConfig(block, "referenceFrequency"));
+    REQUIRE_FALSE(hasConfig(block, "ppsSync"));
+
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"channels", U64{2}},
+                                                   {"clockSource", std::string("external")},
+                                                   {"timeSource", std::string("external")}}) ==
+            Result::SUCCESS);
+    block = viewBlock("radio");
+    REQUIRE(block.state == Block::State::Incomplete);
+    REQUIRE(outputNames(block) == std::vector<std::string>{"signal", "signal2"});
+    REQUIRE(hasConfig(block, "secondAntenna"));
+    REQUIRE(hasConfig(block, "referenceFrequency"));
+    REQUIRE(hasConfig(block, "ppsSync"));
+
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"clockSource", std::string("internal")}}) ==
+            Result::SUCCESS);
+    REQUIRE_FALSE(hasConfig(viewBlock("radio"), "referenceFrequency"));
     REQUIRE(flowgraph->blockDestroy("radio", false) == Result::SUCCESS);
 }
 

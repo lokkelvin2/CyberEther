@@ -54,6 +54,8 @@ struct JETSTREAM_API SoapyDiscovery {
 
 class JETSTREAM_API SoapyReceiver {
  public:
+    static constexpr U64 MaxChannels = 2;
+
     enum class ReadStatus {
         Samples,
         Timeout,
@@ -76,11 +78,25 @@ class JETSTREAM_API SoapyReceiver {
     Result open(const std::string& deviceString);
     Result openArgs(const SoapyKwargs& args);
     Result validateSettings(F32 sampleRate, F32 frequency) const;
-    const std::vector<std::string>& listAntennas() const;
+    const std::vector<std::string>& listAntennas(U64 channel = 0) const;
+    const std::vector<std::string>& listClockSources() const;
+    const std::vector<std::string>& listTimeSources() const;
     const std::optional<SoapyAbi::Range>& getGainRange() const;
     bool supportsBiasTee() const;
+    bool supportsReferenceLock() const;
+    bool supportsPpsTime() const;
     F32 clampGain(F32 gain) const;
-    Result setAntenna(const std::string& antenna);
+    // Channels 0 to count - 1 are tuned together and streamed. Call before tuning.
+    Result setChannels(U64 count);
+    Result setAntenna(U64 channel, const std::string& antenna);
+    Result setClockSource(const std::string& source);
+    Result setReferenceClockRate(F32 rate);
+    Result setTimeSource(const std::string& source);
+    // Waits for a PPS edge, sets the device time to the next whole host UTC second at the
+    // following edge, and waits for that edge. Returns the device time of that edge.
+    Result syncTimeToPps(I64& edgeTimeNs);
+    std::optional<bool> readReferenceLock() const;
+    std::optional<I64> readLastPpsTime() const;
     Result setTunerFrequency(F32 frequency);
     Result setSampleRate(F32 sampleRate);
     Result setAutomaticGain(bool automaticGain);
@@ -88,9 +104,16 @@ class JETSTREAM_API SoapyReceiver {
     Result setBiasTee(bool enabled);
     Result startStream(const std::string& streamString);
     Result startStreamArgs(const SoapyKwargs& args);
+    // Split form of startStream for timed starts. Setting up the stream can change the master
+    // clock (UHD does for two channels), which invalidates the device time, so sync the time
+    // between the two calls. A start time starts the stream at that device time.
+    Result setupStream(const std::string& streamString);
+    Result setupStreamArgs(const SoapyKwargs& args);
+    Result activateStream(std::optional<I64> startTimeNs = std::nullopt);
     void reset();
 
-    ReadResult read(std::span<CF32> samples);
+    // One buffer per streamed channel, each with room for sampleCount samples.
+    ReadResult read(std::span<CF32* const> buffers, std::size_t sampleCount);
 
  private:
     enum class State {
@@ -102,18 +125,27 @@ class JETSTREAM_API SoapyReceiver {
 
     Result queryCapabilities();
     void queryGainRange();
+    std::vector<std::string> readStrings(char** (*function)(const SoapyAbi::Device*, std::size_t*),
+                                         const char* what) const;
     std::string failure() const;
 
     State state = State::Closed;
     std::shared_ptr<SoapyLibrary> library;
     SoapyAbi::Device* device = nullptr;
     SoapyAbi::Stream* stream = nullptr;
+    U64 availableChannels = 1;
+    U64 channels = 1;
     std::vector<SoapyAbi::Range> sampleRateRanges;
     std::vector<SoapyAbi::Range> frequencyRanges;
-    std::vector<std::string> antennas;
+    std::vector<SoapyAbi::Range> referenceClockRates;
+    std::vector<std::vector<std::string>> antennas;
+    std::vector<std::string> clockSources;
+    std::vector<std::string> timeSources;
     std::optional<SoapyAbi::Range> gainRange;
     bool biasTeeSupported = false;
     bool biasTeeNeedsCleanup = false;
+    bool referenceLockSupported = false;
+    bool ppsTimeSupported = false;
 };
 
 struct JETSTREAM_API SoapyReceiveStatus {

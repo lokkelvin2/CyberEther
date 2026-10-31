@@ -1,10 +1,12 @@
 #include "soapysdr.hh"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include <jetstream/logger.hh>
 
@@ -286,20 +288,62 @@ Result SoapyReceiver::queryCapabilities() {
     }
     api.argInfoListClear(settings, settingCount);
 
-    std::size_t antennaCount = 0;
-    char** names = api.listAntennas(device, SoapyAbi::RX, 0, &antennaCount);
+    const std::size_t channelCount = api.getNumChannels(device, SoapyAbi::RX);
     if (api.lastStatus() == 0) {
-        for (std::size_t i = 0; i < antennaCount; ++i) {
-            antennas.emplace_back(names[i] ? names[i] : "");
-        }
+        availableChannels = std::max<U64>(channelCount, 1);
     } else {
-        JST_WARN("[MODULE_SOAPY] Failed to query receive antennas: {}", failure());
+        JST_WARN("[MODULE_SOAPY] Failed to query receive channels: {}", failure());
+        availableChannels = 1;
     }
-    api.stringsClear(&names, antennaCount);
+
+    antennas.assign(std::min(availableChannels, MaxChannels), {});
+    for (U64 channel = 0; channel < antennas.size(); ++channel) {
+        std::size_t antennaCount = 0;
+        char** names = api.listAntennas(device, SoapyAbi::RX, channel, &antennaCount);
+        if (api.lastStatus() == 0) {
+            for (std::size_t i = 0; i < antennaCount; ++i) {
+                antennas[channel].emplace_back(names[i] ? names[i] : "");
+            }
+        } else {
+            JST_WARN("[MODULE_SOAPY] Failed to query receive antennas of channel {}: {}", channel, failure());
+        }
+        api.stringsClear(&names, antennaCount);
+    }
+
+    clockSources = readStrings(api.listClockSources, "clock sources");
+    timeSources = readStrings(api.listTimeSources, "time sources");
+    const auto sensors = readStrings(api.listSensors, "sensors");
+    referenceLockSupported = std::find(sensors.begin(), sensors.end(), "ref_locked") != sensors.end();
+
+    std::size_t rateCount = 0;
+    auto* rates = api.getReferenceClockRates(device, &rateCount);
+    if (api.lastStatus() == 0 && rates) {
+        referenceClockRates.assign(rates, rates + rateCount);
+    }
+    api.free(rates);
+
+    ppsTimeSupported = api.hasHardwareTime(device, "PPS") && api.lastStatus() == 0;
 
     queryGainRange();
 
     return Result::SUCCESS;
+}
+
+std::vector<std::string> SoapyReceiver::readStrings(char** (*function)(const SoapyAbi::Device*, std::size_t*),
+                                                    const char* what) const {
+    const auto& api = library->api();
+    std::vector<std::string> strings;
+    std::size_t count = 0;
+    char** list = function(device, &count);
+    if (api.lastStatus() == 0) {
+        for (std::size_t i = 0; i < count; ++i) {
+            strings.emplace_back(list[i] ? list[i] : "");
+        }
+    } else {
+        JST_WARN("[MODULE_SOAPY] Failed to query {}: {}", what, failure());
+    }
+    api.stringsClear(&list, count);
+    return strings;
 }
 
 void SoapyReceiver::queryGainRange() {
@@ -330,12 +374,29 @@ Result SoapyReceiver::validateSettings(const F32 sampleRate, const F32 frequency
     return Result::SUCCESS;
 }
 
-const std::vector<std::string>& SoapyReceiver::listAntennas() const {
-    return antennas;
+const std::vector<std::string>& SoapyReceiver::listAntennas(const U64 channel) const {
+    static const std::vector<std::string> none;
+    return channel < antennas.size() ? antennas[channel] : none;
+}
+
+const std::vector<std::string>& SoapyReceiver::listClockSources() const {
+    return clockSources;
+}
+
+const std::vector<std::string>& SoapyReceiver::listTimeSources() const {
+    return timeSources;
 }
 
 bool SoapyReceiver::supportsBiasTee() const {
     return biasTeeSupported;
+}
+
+bool SoapyReceiver::supportsReferenceLock() const {
+    return referenceLockSupported;
+}
+
+bool SoapyReceiver::supportsPpsTime() const {
+    return ppsTimeSupported;
 }
 
 const std::optional<SoapyAbi::Range>& SoapyReceiver::getGainRange() const {
@@ -357,7 +418,26 @@ F32 SoapyReceiver::clampGain(const F32 gain) const {
     return applied;
 }
 
-Result SoapyReceiver::setAntenna(const std::string& antenna) {
+Result SoapyReceiver::setChannels(const U64 count) {
+    if (state != State::Open) {
+        JST_ERROR("[MODULE_SOAPY] Cannot change channels in the current device state.");
+        return Result::ERROR;
+    }
+    if (count == 0 || count > MaxChannels) {
+        JST_ERROR("[MODULE_SOAPY] Channels must be between 1 and {}.", MaxChannels);
+        return Result::ERROR;
+    }
+    if (count > availableChannels) {
+        JST_ERROR("[MODULE_SOAPY] The selected device has {} receive channel(s), so it cannot stream {}.",
+                  availableChannels, count);
+        return Result::ERROR;
+    }
+
+    channels = count;
+    return Result::SUCCESS;
+}
+
+Result SoapyReceiver::setAntenna(const U64 channel, const std::string& antenna) {
     if (state == State::Closed) {
         JST_ERROR("[MODULE_SOAPY] Cannot set antenna without an active device.");
         return Result::ERROR;
@@ -365,17 +445,178 @@ Result SoapyReceiver::setAntenna(const std::string& antenna) {
     if (antenna.empty()) {
         return Result::SUCCESS;
     }
-    if (std::find(antennas.begin(), antennas.end(), antenna) == antennas.end()) {
-        JST_ERROR("[MODULE_SOAPY] Receive antenna '{}' is not supported by the selected device.", antenna);
+    const auto& available = listAntennas(channel);
+    if (std::find(available.begin(), available.end(), antenna) == available.end()) {
+        JST_ERROR("[MODULE_SOAPY] Receive antenna '{}' is not supported on channel {} of the selected device.",
+                  antenna, channel);
         return Result::ERROR;
     }
 
-    if (library->api().setAntenna(device, SoapyAbi::RX, 0, antenna.c_str()) != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to set receive antenna '{}': {}", antenna, failure());
+    if (library->api().setAntenna(device, SoapyAbi::RX, channel, antenna.c_str()) != 0) {
+        JST_ERROR("[MODULE_SOAPY] Failed to set receive antenna '{}' on channel {}: {}", antenna, channel, failure());
         return Result::ERROR;
     }
 
     return Result::SUCCESS;
+}
+
+Result SoapyReceiver::setClockSource(const std::string& source) {
+    if (state == State::Closed) {
+        JST_ERROR("[MODULE_SOAPY] Cannot set clock source without an active device.");
+        return Result::ERROR;
+    }
+    if (source.empty()) {
+        return Result::SUCCESS;
+    }
+    if (std::find(clockSources.begin(), clockSources.end(), source) == clockSources.end()) {
+        JST_ERROR("[MODULE_SOAPY] Clock source '{}' is not supported by the selected device.", source);
+        return Result::ERROR;
+    }
+
+    if (library->api().setClockSource(device, source.c_str()) != 0) {
+        JST_ERROR("[MODULE_SOAPY] Failed to set clock source '{}': {}", source, failure());
+        return Result::ERROR;
+    }
+
+    return Result::SUCCESS;
+}
+
+Result SoapyReceiver::setReferenceClockRate(const F32 rate) {
+    if (state == State::Closed) {
+        JST_ERROR("[MODULE_SOAPY] Cannot set reference frequency without an active device.");
+        return Result::ERROR;
+    }
+    if (rate <= 0.0f) {
+        return Result::SUCCESS;
+    }
+    if (referenceClockRates.empty()) {
+        // SoapySDR's default implementation ignores the rate, so say so instead of failing quietly.
+        JST_WARN("[MODULE_SOAPY] The driver cannot change the reference frequency ({:.3f} MHz requested). "
+                 "The radio expects its fixed reference input frequency (10 MHz on Ettus B2xx).", rate / 1e6);
+        return Result::SUCCESS;
+    }
+    if (!SoapyRangeContains(referenceClockRates, rate)) {
+        JST_ERROR("[MODULE_SOAPY] Reference frequency ({:.3f} MHz) not supported.", rate / 1e6);
+        return Result::ERROR;
+    }
+
+    if (library->api().setReferenceClockRate(device, rate) != 0) {
+        JST_ERROR("[MODULE_SOAPY] Failed to set reference frequency: {}", failure());
+        return Result::ERROR;
+    }
+
+    return Result::SUCCESS;
+}
+
+Result SoapyReceiver::setTimeSource(const std::string& source) {
+    if (state == State::Closed) {
+        JST_ERROR("[MODULE_SOAPY] Cannot set time source without an active device.");
+        return Result::ERROR;
+    }
+    if (source.empty()) {
+        return Result::SUCCESS;
+    }
+    if (std::find(timeSources.begin(), timeSources.end(), source) == timeSources.end()) {
+        JST_ERROR("[MODULE_SOAPY] Time source '{}' is not supported by the selected device.", source);
+        return Result::ERROR;
+    }
+
+    if (library->api().setTimeSource(device, source.c_str()) != 0) {
+        JST_ERROR("[MODULE_SOAPY] Failed to set time source '{}': {}", source, failure());
+        return Result::ERROR;
+    }
+
+    return Result::SUCCESS;
+}
+
+Result SoapyReceiver::syncTimeToPps(I64& edgeTimeNs) {
+    if (state == State::Closed) {
+        JST_ERROR("[MODULE_SOAPY] Cannot sync time without an active device.");
+        return Result::ERROR;
+    }
+    if (!ppsTimeSupported) {
+        JST_ERROR("[MODULE_SOAPY] The selected device cannot set its time from a PPS input.");
+        return Result::ERROR;
+    }
+
+    // A PPS edge arrives once per second, so allow a bit more than one period.
+    constexpr auto PpsTimeout = std::chrono::milliseconds(1500);
+    constexpr I64 NanosecondsPerSecond = 1'000'000'000;
+    const auto waitForEdge = [&](const I64 previous, I64& edge) {
+        const auto deadline = std::chrono::steady_clock::now() + PpsTimeout;
+        while (true) {
+            const auto time = readLastPpsTime();
+            if (!time) {
+                JST_ERROR("[MODULE_SOAPY] Failed to read the PPS time: {}", failure());
+                return Result::ERROR;
+            }
+            if (*time != previous) {
+                edge = *time;
+                return Result::SUCCESS;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                JST_ERROR("[MODULE_SOAPY] No PPS edge within {} ms. Check the 1PPS input and the Time Source.",
+                          PpsTimeout.count());
+                return Result::ERROR;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+
+    // Set the time just after an edge, so the next edge is about a second away.
+    const auto initial = readLastPpsTime();
+    if (!initial) {
+        JST_ERROR("[MODULE_SOAPY] Failed to read the PPS time: {}", failure());
+        return Result::ERROR;
+    }
+    I64 edge = 0;
+    JST_CHECK(waitForEdge(*initial, edge));
+
+    // The edge just seen began the current host second, so the next one begins the following second.
+    const auto hostSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    edgeTimeNs = (static_cast<I64>(hostSeconds) + 1) * NanosecondsPerSecond;
+    if (library->api().setHardwareTime(device, edgeTimeNs, "PPS") != 0) {
+        JST_ERROR("[MODULE_SOAPY] Failed to set the device time at the next PPS edge: {}", failure());
+        return Result::ERROR;
+    }
+
+    I64 applied = 0;
+    JST_CHECK(waitForEdge(edge, applied));
+    if (applied != edgeTimeNs) {
+        JST_ERROR("[MODULE_SOAPY] PPS time sync failed: the device time at the PPS edge is {} ns, not {} ns.",
+                  applied, edgeTimeNs);
+        return Result::ERROR;
+    }
+
+    return Result::SUCCESS;
+}
+
+std::optional<bool> SoapyReceiver::readReferenceLock() const {
+    if (state == State::Closed || !referenceLockSupported) {
+        return std::nullopt;
+    }
+    const auto& api = library->api();
+    char* value = api.readSensor(device, "ref_locked");
+    const bool ok = api.lastStatus() == 0 && value;
+    const std::string text = value ? value : "";
+    api.free(value);
+    if (!ok) {
+        return std::nullopt;
+    }
+    return text == "true" || text == "1";
+}
+
+std::optional<I64> SoapyReceiver::readLastPpsTime() const {
+    if (state == State::Closed || !ppsTimeSupported) {
+        return std::nullopt;
+    }
+    const auto& api = library->api();
+    const long long time = api.getHardwareTime(device, "PPS");
+    if (api.lastStatus() != 0) {
+        return std::nullopt;
+    }
+    return static_cast<I64>(time);
 }
 
 Result SoapyReceiver::setTunerFrequency(const F32 frequency) {
@@ -390,9 +631,11 @@ Result SoapyReceiver::setTunerFrequency(const F32 frequency) {
     }
 
     const SoapyKwargsView args({});
-    if (library->api().setFrequency(device, SoapyAbi::RX, 0, frequency, args.get()) != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to set frequency: {}", failure());
-        return Result::ERROR;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        if (library->api().setFrequency(device, SoapyAbi::RX, channel, frequency, args.get()) != 0) {
+            JST_ERROR("[MODULE_SOAPY] Failed to set frequency: {}", failure());
+            return Result::ERROR;
+        }
     }
 
     queryGainRange();
@@ -411,9 +654,11 @@ Result SoapyReceiver::setSampleRate(const F32 sampleRate) {
         return Result::WARNING;
     }
 
-    if (library->api().setSampleRate(device, SoapyAbi::RX, 0, sampleRate) != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to set sample rate: {}", failure());
-        return Result::ERROR;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        if (library->api().setSampleRate(device, SoapyAbi::RX, channel, sampleRate) != 0) {
+            JST_ERROR("[MODULE_SOAPY] Failed to set sample rate: {}", failure());
+            return Result::ERROR;
+        }
     }
 
     return Result::SUCCESS;
@@ -438,9 +683,11 @@ Result SoapyReceiver::setAutomaticGain(const bool automaticGain) {
         return Result::SUCCESS;
     }
 
-    if (api.setGainMode(device, SoapyAbi::RX, 0, automaticGain) != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to set gain mode: {}", failure());
-        return Result::ERROR;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        if (api.setGainMode(device, SoapyAbi::RX, channel, automaticGain) != 0) {
+            JST_ERROR("[MODULE_SOAPY] Failed to set gain mode: {}", failure());
+            return Result::ERROR;
+        }
     }
 
     return Result::SUCCESS;
@@ -452,9 +699,11 @@ Result SoapyReceiver::setGain(const F32 gain) {
         return Result::ERROR;
     }
 
-    if (library->api().setGain(device, SoapyAbi::RX, 0, gain) != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to set gain: {}", failure());
-        return Result::ERROR;
+    for (U64 channel = 0; channel < channels; ++channel) {
+        if (library->api().setGain(device, SoapyAbi::RX, channel, gain) != 0) {
+            JST_ERROR("[MODULE_SOAPY] Failed to set gain: {}", failure());
+            return Result::ERROR;
+        }
     }
 
     return Result::SUCCESS;
@@ -481,32 +730,57 @@ Result SoapyReceiver::setBiasTee(const bool enabled) {
 }
 
 Result SoapyReceiver::startStream(const std::string& streamString) {
+    JST_CHECK(setupStream(streamString));
+    return activateStream();
+}
+
+Result SoapyReceiver::startStreamArgs(const SoapyKwargs& args) {
+    JST_CHECK(setupStreamArgs(args));
+    return activateStream();
+}
+
+Result SoapyReceiver::setupStream(const std::string& streamString) {
     if (!library) {
         JST_ERROR("[MODULE_SOAPY] Cannot setup stream without an active device.");
         return Result::ERROR;
     }
     SoapyKwargs args;
     JST_CHECK(library->kwargsFromString(streamString, args));
-    return startStreamArgs(args);
+    return setupStreamArgs(args);
 }
 
-Result SoapyReceiver::startStreamArgs(const SoapyKwargs& args) {
+Result SoapyReceiver::setupStreamArgs(const SoapyKwargs& args) {
     if (state != State::Open) {
         JST_ERROR("[MODULE_SOAPY] Cannot setup stream in the current device state.");
         return Result::ERROR;
     }
     const auto& api = library->api();
 
-    const std::size_t channels[] = {0};
+    std::vector<std::size_t> streamChannels(channels);
+    for (U64 channel = 0; channel < channels; ++channel) {
+        streamChannels[channel] = channel;
+    }
     const SoapyKwargsView view(args);
-    stream = api.setupStream(device, SoapyAbi::RX, SoapyAbi::FormatCF32, channels, 1, view.get());
+    stream = api.setupStream(device, SoapyAbi::RX, SoapyAbi::FormatCF32, streamChannels.data(),
+                             streamChannels.size(), view.get());
     if (stream == nullptr) {
         JST_ERROR("[MODULE_SOAPY] Failed to setup stream: {}", failure());
         return Result::ERROR;
     }
     state = State::StreamReady;
 
-    const int activationResult = api.activateStream(device, stream, 0, 0, 0);
+    return Result::SUCCESS;
+}
+
+Result SoapyReceiver::activateStream(const std::optional<I64> startTimeNs) {
+    if (state != State::StreamReady) {
+        JST_ERROR("[MODULE_SOAPY] Cannot activate stream in the current device state.");
+        return Result::ERROR;
+    }
+
+    const int activationFlags = startTimeNs ? SoapyAbi::HasTime : 0;
+    const int activationResult = library->api().activateStream(device, stream, activationFlags,
+                                                               startTimeNs.value_or(0), 0);
     if (activationResult != 0) {
         JST_ERROR("[MODULE_SOAPY] Failed to configure device: activateStream returned status {}",
                   activationResult);
@@ -517,22 +791,27 @@ Result SoapyReceiver::startStreamArgs(const SoapyKwargs& args) {
     return Result::SUCCESS;
 }
 
-SoapyReceiver::ReadResult SoapyReceiver::read(const std::span<CF32> samples) {
+SoapyReceiver::ReadResult SoapyReceiver::read(const std::span<CF32* const> buffers,
+                                              const std::size_t sampleCount) {
     if (state != State::Streaming) {
         return {.error = "Cannot read without an active stream"};
     }
-    if (samples.empty()) {
+    if (sampleCount == 0) {
         return {.error = "Receive buffer cannot be empty"};
     }
+    if (buffers.size() != channels) {
+        return {.error = "One receive buffer per channel is required"};
+    }
 
-    void* buffers[] = {samples.data()};
+    std::array<void*, MaxChannels> channelBuffers{};
+    std::copy(buffers.begin(), buffers.end(), channelBuffers.begin());
     int flags = 0;
     long long timeNs = 0;
-    const int result = library->api().readStream(device, stream, buffers, samples.size(),
+    const int result = library->api().readStream(device, stream, channelBuffers.data(), sampleCount,
                                                  &flags, &timeNs, 100000);
 
     if (result > 0) {
-        if (static_cast<std::size_t>(result) > samples.size()) {
+        if (static_cast<std::size_t>(result) > sampleCount) {
             return {.error = "Device returned more samples than requested"};
         }
         ReadResult received{
@@ -583,12 +862,19 @@ void SoapyReceiver::reset() {
         state = State::Closed;
     }
 
+    availableChannels = 1;
+    channels = 1;
     sampleRateRanges.clear();
     frequencyRanges.clear();
+    referenceClockRates.clear();
     antennas.clear();
+    clockSources.clear();
+    timeSources.clear();
     gainRange.reset();
     biasTeeSupported = false;
     biasTeeNeedsCleanup = false;
+    referenceLockSupported = false;
+    ppsTimeSupported = false;
     library.reset();
 }
 

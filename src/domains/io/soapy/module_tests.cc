@@ -1,13 +1,19 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <chrono>
 #include <limits>
+#include <thread>
 
 #include "environment.hh"
 #include "jetstream/domains/io/soapy/module.hh"
+#include "jetstream/module_context.hh"
 #include "jetstream/module_interface.hh"
 #include "jetstream/registry.hh"
+#include "jetstream/runtime_context_native_cpu.hh"
+#include "jetstream/scheduler_context.hh"
 #include "library/soapysdr.hh"
+#include "module_impl.hh"
 #include "scripted_soapy.hh"
 
 using namespace Jetstream;
@@ -33,6 +39,23 @@ std::shared_ptr<Module> BuildSoapyModule() {
     return module;
 }
 
+struct ModuleCleanup {
+    std::shared_ptr<Module> module;
+    ~ModuleCleanup() { static_cast<void>(module->destroy()); }
+};
+
+template<typename Predicate>
+bool WaitFor(Predicate predicate, const std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
 }  // namespace
 
 TEST_CASE("Soapy validates configuration before accessing the runtime",
@@ -53,6 +76,15 @@ TEST_CASE("Soapy validates configuration before accessing the runtime",
     }
     SECTION("overflowing buffer dimensions") {
         config.numberOfBatches = std::numeric_limits<U64>::max();
+    }
+    SECTION("no channels") {
+        config.channels = 0;
+    }
+    SECTION("more channels than supported") {
+        config.channels = Modules::SoapyReceiver::MaxChannels + 1;
+    }
+    SECTION("negative reference frequency") {
+        config.referenceFrequency = -10.0e6f;
     }
 
     const auto module = BuildSoapyModule();
@@ -218,4 +250,192 @@ TEST_CASE_METHOD(TestSoapy::Runtime,
     REQUIRE(config.deserialize(edit) == Result::SUCCESS);
     checkApplied();
     REQUIRE(TestSoapy::State().concurrentChanges == 0);
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy streams two channels with their own antennas and aligned samples",
+                 "[modules][soapy][channels]") {
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().deliverSamples = true;
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.channels = 2;
+    config.antenna = "RX2";
+    config.secondAntenna = "TX/RX";
+    config.numberOfBatches = 2;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("test", config, {}) == Result::SUCCESS);
+    REQUIRE(module->interface()->outputs() == std::vector<std::string>{"signal", "signal2"});
+    REQUIRE(TestSoapy::State().streamChannels == std::vector<std::size_t>{0, 1});
+    REQUIRE(TestSoapy::State().settings().antennas == std::array<std::string, 2>{"RX2", "TX/RX"});
+    REQUIRE((TestSoapy::State().activationFlags & Modules::SoapyAbi::HasTime) == 0);
+
+    const auto runtime = std::dynamic_pointer_cast<NativeCpuRuntimeContext>(module->context()->runtime());
+    REQUIRE(runtime != nullptr);
+    const auto& first = module->outputs().at("signal").tensor;
+    const auto& second = module->outputs().at("signal2").tensor;
+    REQUIRE(first.size() == 16);
+    REQUIRE(second.size() == 16);
+
+    for (int frame = 0; frame < 3; ++frame) {
+        REQUIRE(WaitFor([&] { return module->context()->scheduler()->hasPendingCompute() == Result::SUCCESS; }));
+        REQUIRE(runtime->computeSubmit() == Result::SUCCESS);
+        for (U64 i = 0; i < first.size(); ++i) {
+            CAPTURE(frame, i);
+            REQUIRE(first.data<CF32>()[i].imag() == 0.0f);
+            REQUIRE(second.data<CF32>()[i].imag() == 1.0f);
+            REQUIRE(first.data<CF32>()[i].real() == second.data<CF32>()[i].real());
+        }
+    }
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy refuses more channels than the device has",
+                 "[modules][soapy][channels]") {
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().deviceChannels = 1;
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.channels = 2;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    REQUIRE(module->create("test", config, {}) == Result::ERROR);
+    REQUIRE(TestSoapy::State().streamChannels.empty());
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy applies the clock source and reference frequency and reports reference lock",
+                 "[modules][soapy][clock]") {
+    const bool adjustable = GENERATE(true, false);
+    CAPTURE(adjustable);
+    if (adjustable) {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().referenceRates = {{10.0e6, 10.0e6, 0.0}, {30.72e6, 30.72e6, 0.0}};
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.clockSource = "external";
+    config.referenceFrequency = 10.0e6f;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("test", config, {}) == Result::SUCCESS);
+    const auto applied = TestSoapy::State().settings();
+    REQUIRE(applied.clockSource == "external");
+    // Without reported rates the driver cannot change the reference, so it is left alone.
+    REQUIRE(applied.referenceRate == (adjustable ? 10.0e6 : 0.0));
+    REQUIRE(applied.timeSource.empty());
+
+    auto* soapy = module->getImpl<Modules::SoapyImpl>();
+    REQUIRE(WaitFor([&] { return soapy->getReferenceLock() == std::optional<bool>{true}; }));
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().referenceLocked = false;
+    }
+    REQUIRE(WaitFor([&] { return soapy->getReferenceLock() == std::optional<bool>{false}; }));
+    REQUIRE_FALSE(soapy->getPpsStatus().monitored);
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy rejects reference frequencies the driver does not list",
+                 "[modules][soapy][clock]") {
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().referenceRates = {{10.0e6, 10.0e6, 0.0}};
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.clockSource = "external";
+    config.referenceFrequency = 20.0e6f;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    REQUIRE(module->create("test", config, {}) == Result::ERROR);
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy PPS sync sets the device time at a PPS edge and starts on the next one",
+                 "[modules][soapy][pps]") {
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.timeSource = "external";
+    config.ppsSync = true;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    const ModuleCleanup cleanup{module};
+    const auto before = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    REQUIRE(module->create("test", config, {}) == Result::SUCCESS);
+    const auto after = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    REQUIRE(TestSoapy::State().settings().timeSource == "external");
+    REQUIRE(TestSoapy::State().timeSetAfterSetup);
+    REQUIRE((TestSoapy::State().activationFlags & Modules::SoapyAbi::HasTime) != 0);
+    const long long start = TestSoapy::State().activationTimeNs;
+    REQUIRE(start % 1'000'000'000 == 0);
+    // The device time was set to the host second after the edge, and streaming starts one edge later.
+    REQUIRE(start / 1'000'000'000 >= before + 2);
+    REQUIRE(start / 1'000'000'000 <= after + 2);
+
+    auto* soapy = module->getImpl<Modules::SoapyImpl>();
+    REQUIRE(WaitFor([&] {
+        const auto status = soapy->getPpsStatus();
+        return status.monitored && status.present;
+    }));
+    REQUIRE(soapy->getPpsStatus().lastTimeNs >= start - 1'000'000'000);
+    REQUIRE_FALSE(soapy->getReferenceLock());
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy PPS sync fails when no PPS edge arrives",
+                 "[modules][soapy][pps]") {
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().ppsPresent = false;
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.timeSource = "external";
+    config.ppsSync = true;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    REQUIRE(module->create("test", config, {}) == Result::ERROR);
+    REQUIRE(TestSoapy::State().activations == 0);
+}
+
+TEST_CASE_METHOD(TestSoapy::Runtime,
+                 "Soapy ignores a saved PPS sync without a time source",
+                 "[modules][soapy][pps]") {
+    {
+        std::lock_guard lock(TestSoapy::State().mutex);
+        TestSoapy::State().ppsPresent = false;
+    }
+    Modules::Soapy config;
+    config.deviceString = "driver=scripted";
+    config.ppsSync = true;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+
+    const auto module = BuildSoapyModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("test", config, {}) == Result::SUCCESS);
+    REQUIRE((TestSoapy::State().activationFlags & Modules::SoapyAbi::HasTime) == 0);
+    REQUIRE_FALSE(module->getImpl<Modules::SoapyImpl>()->getPpsStatus().monitored);
 }

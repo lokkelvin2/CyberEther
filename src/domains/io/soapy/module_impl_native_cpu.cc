@@ -41,7 +41,8 @@ Result SoapyImplNativeCpu::hasPendingCompute() {
         return Result::ERROR;
     }
 
-    if (stream.size() < buffer.size()) {
+    // Channel 0 is pushed last, so once it holds a frame every channel does.
+    if (streams[0].size() < buffers[0].size()) {
         return Result::TIMEOUT;
     }
 
