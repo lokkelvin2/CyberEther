@@ -323,6 +323,7 @@ Result SoapyReceiver::queryCapabilities() {
     api.free(rates);
 
     ppsTimeSupported = api.hasHardwareTime(device, "PPS") && api.lastStatus() == 0;
+    hardwareTimeSupported = api.hasHardwareTime(device, "") && api.lastStatus() == 0;
 
     queryGainRange();
 
@@ -619,6 +620,18 @@ std::optional<I64> SoapyReceiver::readLastPpsTime() const {
     return static_cast<I64>(time);
 }
 
+std::optional<I64> SoapyReceiver::readHardwareTime() const {
+    if (state == State::Closed || !hardwareTimeSupported) {
+        return std::nullopt;
+    }
+    const auto& api = library->api();
+    const long long time = api.getHardwareTime(device, "");
+    if (api.lastStatus() != 0) {
+        return std::nullopt;
+    }
+    return static_cast<I64>(time);
+}
+
 Result SoapyReceiver::setTunerFrequency(const F32 frequency) {
     if (state == State::Closed) {
         JST_ERROR("[MODULE_SOAPY] Cannot set frequency without an active device.");
@@ -782,8 +795,8 @@ Result SoapyReceiver::activateStream(const std::optional<I64> startTimeNs) {
     const int activationResult = library->api().activateStream(device, stream, activationFlags,
                                                                startTimeNs.value_or(0), 0);
     if (activationResult != 0) {
-        JST_ERROR("[MODULE_SOAPY] Failed to configure device: activateStream returned status {}",
-                  activationResult);
+        JST_ERROR("[MODULE_SOAPY] Failed to configure device: activateStream returned status {}: {}",
+                  activationResult, failure());
         return Result::ERROR;
     }
     state = State::Streaming;
@@ -875,6 +888,7 @@ void SoapyReceiver::reset() {
     biasTeeNeedsCleanup = false;
     referenceLockSupported = false;
     ppsTimeSupported = false;
+    hardwareTimeSupported = false;
     library.reset();
 }
 

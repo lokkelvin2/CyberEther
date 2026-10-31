@@ -117,6 +117,9 @@ struct Script {
     }
 };
 
+// Device time reported by getHardwareTime("").
+constexpr long long NowNs = 7'000'000'000;
+
 inline Script& State() {
     static Script script;
     return script;
@@ -222,10 +225,10 @@ inline SoapyApi Api() {
         return State().set("timeSource", &Settings::timeSource, std::string(source));
     };
     api.hasHardwareTime = [](const SoapyAbi::Device*, const char* what) {
-        return std::strcmp(what, "PPS") == 0;
+        return std::strcmp(what, "PPS") == 0 || std::strcmp(what, "") == 0;
     };
-    api.getHardwareTime = [](const SoapyAbi::Device*, const char*) -> long long {
-        return State().readPpsTime();
+    api.getHardwareTime = [](const SoapyAbi::Device*, const char* what) -> long long {
+        return std::strcmp(what, "PPS") == 0 ? State().readPpsTime() : NowNs;
     };
     api.setHardwareTime = [](SoapyAbi::Device*, long long timeNs, const char*) {
         std::lock_guard lock(State().mutex);

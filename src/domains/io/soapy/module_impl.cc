@@ -202,6 +202,12 @@ Result SoapyImpl::configureDevice() {
         startTimeNs = edgeTimeNs + 1'000'000'000;
         JST_INFO("[MODULE_SOAPY] Device time synced to PPS. Streaming starts at {} s.",
                  *startTimeNs / 1'000'000'000);
+    } else if (channels > 1) {
+        // UHD refuses to start several channels "now" because they would not start on the same
+        // sample, so start them together shortly after the current device time.
+        if (const auto now = receiverDevice.readHardwareTime()) {
+            startTimeNs = *now + 100'000'000;
+        }
     }
     JST_CHECK(receiverDevice.activateStream(startTimeNs));
     return Result::SUCCESS;

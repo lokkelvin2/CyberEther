@@ -273,7 +273,9 @@ TEST_CASE_METHOD(TestSoapy::Runtime,
     REQUIRE(module->interface()->outputs() == std::vector<std::string>{"signal", "signal2"});
     REQUIRE(TestSoapy::State().streamChannels == std::vector<std::size_t>{0, 1});
     REQUIRE(TestSoapy::State().settings().antennas == std::array<std::string, 2>{"RX2", "TX/RX"});
-    REQUIRE((TestSoapy::State().activationFlags & Modules::SoapyAbi::HasTime) == 0);
+    // UHD rejects an untimed start on several channels, so they start together shortly after now.
+    REQUIRE((TestSoapy::State().activationFlags & Modules::SoapyAbi::HasTime) != 0);
+    REQUIRE(TestSoapy::State().activationTimeNs == TestSoapy::NowNs + 100'000'000);
 
     const auto runtime = std::dynamic_pointer_cast<NativeCpuRuntimeContext>(module->context()->runtime());
     REQUIRE(runtime != nullptr);

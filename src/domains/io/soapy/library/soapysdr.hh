@@ -97,6 +97,8 @@ class JETSTREAM_API SoapyReceiver {
     Result syncTimeToPps(I64& edgeTimeNs);
     std::optional<bool> readReferenceLock() const;
     std::optional<I64> readLastPpsTime() const;
+    // Current device time, or empty when the driver has no hardware time.
+    std::optional<I64> readHardwareTime() const;
     Result setTunerFrequency(F32 frequency);
     Result setSampleRate(F32 sampleRate);
     Result setAutomaticGain(bool automaticGain);
@@ -146,6 +148,7 @@ class JETSTREAM_API SoapyReceiver {
     bool biasTeeNeedsCleanup = false;
     bool referenceLockSupported = false;
     bool ppsTimeSupported = false;
+    bool hardwareTimeSupported = false;
 };
 
 struct JETSTREAM_API SoapyReceiveStatus {
